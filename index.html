@@ -374,14 +374,17 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- lamejs: pure-JS MP3 encoder, no WASM needed, works on iOS Safari -->
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
 <script>
 // ── State ──────────────────────────────────────────
-let mediaRecorder = null;
-let audioChunks = [];
 let audioContext = null;
 let analyser = null;
+let scriptProcessor = null;
 let sourceNode = null;
 let stream = null;
+let mp3Encoder = null;
+let mp3Buffers = [];
 let timerInterval = null;
 let seconds = 0;
 let isRecording = false;
@@ -389,7 +392,10 @@ let isPaused = false;
 let recordings = JSON.parse(localStorage.getItem('recordings') || '[]');
 let currentPlayback = null;
 let waveHistory = new Float32Array(300).fill(0);
-let animFrame = null;
+
+const SAMPLE_RATE = 44100;
+const MP3_BITRATE = 128;
+const SCRIPT_BUFFER = 4096;
 
 // ── DOM ──────────────────────────────────────────
 const btnRec = document.getElementById('btnRec');
@@ -422,35 +428,27 @@ function drawWave() {
   if (analyser && isRecording && !isPaused) {
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteTimeDomainData(data);
-    // Sample RMS
     let sum = 0;
     for (let i = 0; i < data.length; i++) sum += Math.pow((data[i] - 128) / 128, 2);
     const rms = Math.sqrt(sum / data.length);
-    // Shift history
     waveHistory = new Float32Array([...waveHistory.slice(1), rms * 2.5]);
   } else if (!isRecording) {
     waveHistory = new Float32Array(waveHistory.length).fill(0);
   }
 
-  // Draw scrolling waveform
   const step = W / waveHistory.length;
   ctx.beginPath();
-  const accent = isRecording && !isPaused ? '#e84040' : '#3a3a4a';
-  ctx.strokeStyle = accent;
+  ctx.strokeStyle = isRecording && !isPaused ? '#e84040' : '#3a3a4a';
   ctx.lineWidth = 1.5 * dpr;
   ctx.lineCap = 'round';
-
   for (let i = 0; i < waveHistory.length; i++) {
     const x = i * step;
     const amp = waveHistory[i] * (H / 2) * 0.85;
-    const y1 = H / 2 - amp;
-    const y2 = H / 2 + amp;
-    ctx.moveTo(x, y1);
-    ctx.lineTo(x, y2);
+    ctx.moveTo(x, H / 2 - amp);
+    ctx.lineTo(x, H / 2 + amp);
   }
   ctx.stroke();
 
-  // Center line
   ctx.beginPath();
   ctx.strokeStyle = 'rgba(255,255,255,0.05)';
   ctx.lineWidth = 1;
@@ -458,7 +456,7 @@ function drawWave() {
   ctx.lineTo(W, H / 2);
   ctx.stroke();
 
-  animFrame = requestAnimationFrame(drawWave);
+  requestAnimationFrame(drawWave);
 }
 drawWave();
 
@@ -475,37 +473,47 @@ function startTimer() {
 }
 function stopTimer() { clearInterval(timerInterval); }
 
-// ── Recording ──────────────────────────────────────────
+// ── Float32 → Int16 conversion ──────────────────────────────────────────
+function floatTo16BitPCM(float32Array) {
+  const int16 = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return int16;
+}
+
+// ── Recording (ScriptProcessor → lamejs MP3) ──────────────────────────────────────────
 async function startRecording() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        sampleRate: 44100
-      }
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: SAMPLE_RATE }
     });
 
-    // AudioContext for visualizer
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+
+    // Visualizer
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 512;
+
+    // ScriptProcessor for raw PCM access (works on iOS Safari)
+    scriptProcessor = audioContext.createScriptProcessor(SCRIPT_BUFFER, 1, 1);
+
     sourceNode = audioContext.createMediaStreamSource(stream);
     sourceNode.connect(analyser);
+    sourceNode.connect(scriptProcessor);
+    scriptProcessor.connect(audioContext.destination); // must connect to run on iOS
 
-    // MediaRecorder — prefer webm, fallback to mp4/aac (iOS)
-    let mimeType = 'audio/webm;codecs=opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/mp4';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+    // Init lame MP3 encoder (mono, 44100Hz, 128kbps)
+    mp3Encoder = new lamejs.Mp3Encoder(1, audioContext.sampleRate, MP3_BITRATE);
+    mp3Buffers = [];
 
-    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-    audioChunks = [];
-
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) audioChunks.push(e.data);
+    scriptProcessor.onaudioprocess = (e) => {
+      if (!isRecording || isPaused) return;
+      const pcm = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
+      const encoded = mp3Encoder.encodeBuffer(pcm);
+      if (encoded.length > 0) mp3Buffers.push(new Int8Array(encoded));
     };
-
-    mediaRecorder.start(1000); // collect every 1s for robustness
 
     isRecording = true;
     isPaused = false;
@@ -522,15 +530,12 @@ async function startRecording() {
 }
 
 function pauseRecording() {
-  if (!mediaRecorder) return;
+  if (!isRecording) return;
   if (isPaused) {
-    mediaRecorder.resume();
-    if (audioContext?.state === 'suspended') audioContext.resume();
     isPaused = false;
     startTimer();
     setUIRecording();
   } else {
-    mediaRecorder.pause();
     isPaused = true;
     stopTimer();
     setUIPaused();
@@ -538,32 +543,38 @@ function pauseRecording() {
 }
 
 function stopRecording() {
-  if (!mediaRecorder) return;
-  mediaRecorder.stop();
-  stopTimer();
+  if (!isRecording) return;
+
+  // Flush remaining MP3 frames
+  const finalChunk = mp3Encoder.flush();
+  if (finalChunk.length > 0) mp3Buffers.push(new Int8Array(finalChunk));
+
+  // Disconnect nodes
+  scriptProcessor.disconnect();
+  sourceNode.disconnect();
   stream.getTracks().forEach(t => t.stop());
+  audioContext.close();
+
   isRecording = false;
   isPaused = false;
+  stopTimer();
 
-  mediaRecorder.onstop = () => {
-    const mimeType = mediaRecorder.mimeType || 'audio/webm';
-    const ext = mimeType.includes('mp4') ? 'm4a' : 'webm';
-    const blob = new Blob(audioChunks, { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const name = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-').replace(' ','')}`;
-    const rec = { id: Date.now(), name, duration: seconds, url, ext, size: blob.size, date: new Date().toISOString(), blob: null };
-    // Store blob as base64 for persistence
-    const reader = new FileReader();
-    reader.onload = () => {
-      rec.b64 = reader.result;
-      delete rec.url;
-      recordings.unshift(rec);
-      try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {}
-      renderList();
-    };
-    reader.readAsDataURL(blob);
-    showToast('録音を保存しました');
+  // Build MP3 Blob
+  const blob = new Blob(mp3Buffers, { type: 'audio/mpeg' });
+  const name = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/\s]/g,'-')}`;
+  const rec = { id: Date.now(), name, duration: seconds, ext: 'mp3', size: blob.size, date: new Date().toISOString() };
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    rec.b64 = reader.result;
+    recordings.unshift(rec);
+    try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {
+      showToast('容量不足: ダウンロードしてください');
+    }
+    renderList();
+    showToast('MP3で保存しました ✓');
   };
+  reader.readAsDataURL(blob);
 
   setUIIdle();
   bgNotice.classList.remove('show');
@@ -578,7 +589,6 @@ function setUIRecording() {
   timerLabel.textContent = '録音時間';
   btnPause.disabled = false;
   btnSave.disabled = false;
-  // Pause icon
   btnPause.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
 }
 function setUIPaused() {
@@ -587,7 +597,6 @@ function setUIPaused() {
   statusText.textContent = '一時停止';
   timerEl.classList.remove('recording');
   timerLabel.textContent = '経過時間（停止中）';
-  // Resume icon
   btnPause.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5,3 19,12 5,21"/></svg>`;
 }
 function setUIIdle() {
@@ -603,15 +612,9 @@ function setUIIdle() {
 }
 
 // ── Button handlers ──────────────────────────────────────────
-btnRec.addEventListener('click', () => {
-  if (!isRecording) startRecording();
-});
-btnPause.addEventListener('click', () => {
-  if (isRecording) pauseRecording();
-});
-btnSave.addEventListener('click', () => {
-  if (isRecording) stopRecording();
-});
+btnRec.addEventListener('click', () => { if (!isRecording) startRecording(); });
+btnPause.addEventListener('click', () => { if (isRecording) pauseRecording(); });
+btnSave.addEventListener('click', () => { if (isRecording) stopRecording(); });
 
 // ── Render list ──────────────────────────────────────────
 function renderList() {
@@ -623,7 +626,7 @@ function renderList() {
     <div class="recording-item" data-i="${i}">
       <div class="item-icon">🎵</div>
       <div class="item-info">
-        <div class="item-name">${r.name}</div>
+        <div class="item-name">${r.name}.mp3</div>
         <div class="item-meta">
           <span>${fmtTime(r.duration)}</span>
           <span>${(r.size/1024).toFixed(0)}KB</span>
@@ -644,7 +647,6 @@ function renderList() {
     </div>
   `).join('');
 
-  // Events
   listEl.querySelectorAll('[data-play]').forEach(btn => {
     btn.addEventListener('click', e => { e.stopPropagation(); playRecording(parseInt(btn.dataset.play), btn); });
   });
@@ -672,9 +674,9 @@ function downloadRecording(i) {
   if (!r.b64) return;
   const a = document.createElement('a');
   a.href = r.b64;
-  a.download = `${r.name}.${r.ext || 'webm'}`;
+  a.download = `${r.name}.mp3`;
   a.click();
-  showToast('ダウンロード開始');
+  showToast('MP3ダウンロード開始');
 }
 
 function deleteRecording(i) {
@@ -693,7 +695,7 @@ function showToast(msg) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 2200);
 }
 
-// ── PWA / wake lock (iOS doesn't support this, but try) ──────────────────────────────────────────
+// ── Wake Lock ──────────────────────────────────────────
 let wakeLock = null;
 async function requestWakeLock() {
   if ('wakeLock' in navigator) {
@@ -713,13 +715,9 @@ if ('serviceWorker' in navigator) {
 renderList();
 setUIIdle();
 
-// Show notice on iOS
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-const isStandalone = window.navigator.standalone;
-if (isIOS && !isStandalone) {
-  setTimeout(() => {
-    showToast('ホーム画面に追加するとバックグラウンド録音できます');
-  }, 2000);
+if (isIOS && !window.navigator.standalone) {
+  setTimeout(() => showToast('ホーム画面に追加するとバックグラウンド録音できます'), 2000);
 }
 </script>
 </body>
