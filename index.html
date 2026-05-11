@@ -706,11 +706,11 @@ function stopRecording() {
       if (final.length > 0) mp3Parts.push(new Uint8Array(final));
 
       const mp3Blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
-      saveRecording(mp3Blob);
+      await saveRecording(mp3Blob);
     } catch (e) {
       // デコード失敗時はネイティブ形式で保存
       console.warn('MP3変換失敗、元形式で保存:', e);
-      saveRecording(recBlob, recMime.includes('mp4') ? 'm4a' : 'webm');
+      await saveRecording(recBlob, recMime.includes('mp4') ? 'm4a' : 'webm');
     }
   };
 
@@ -775,17 +775,21 @@ async function saveRecording(blob, ext = 'mp3') {
 
   const name = resolveUniqueName(inputName.replace(/[/\\:*?"<>|]/g, '_'));
   const rec = { id: Date.now(), name, duration: dur, ext, size: blob.size, date: new Date().toISOString() };
-  const reader = new FileReader();
-  reader.onload = () => {
-    rec.b64 = reader.result;
-    recordings.unshift(rec);
-    try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {
-      showToast('容量不足: すぐにダウンロードしてください');
-    }
-    renderList();
-    showToast(`「${name}」を保存しました ✓`);
-  };
-  reader.readAsDataURL(blob);
+
+  await new Promise(resolve => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      rec.b64 = reader.result;
+      recordings.unshift(rec);
+      try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {
+        showToast('容量不足: すぐにダウンロードしてください');
+      }
+      renderList();
+      showToast(`「${name}」を保存しました ✓`);
+      resolve();
+    };
+    reader.readAsDataURL(blob);
+  });
 }
 
 // ── Rename Recording ──────────────────────────────────────────
