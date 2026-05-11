@@ -493,27 +493,30 @@ let waveHistory = new Float32Array(300).fill(0);
 const MP3_BITRATE = 128;
 
 // ── Silent Audio（iOSオーディオセッション維持）──────────────────────────────────────────
-// iOSはオーディオ出力がないとバックグラウンドでオーディオ処理を止める。
-// 無音WAVをloop再生することでセッションを「アクティブ」に保つ。
-function createSilentAudio() {
-  // 60分分の無音バッファを生成。
-  // ループの繋ぎ目回数を最小化（2時間録音でも2回のみ）。
-  // 無音データはすべて0なのでメモリ消費はほぼゼロ。
-  const sr = 44100, n = sr * 60 * 60; // 60分
-  const buf = new ArrayBuffer(44 + n * 2);
-  const v = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0,'RIFF'); v.setUint32(4, 36 + n*2, true);
-  w(8,'WAVE'); w(12,'fmt ');
-  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
-  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
-  v.setUint16(32,2,true); v.setUint16(34,16,true);
-  w(36,'data'); v.setUint32(40,n*2,true);
-  const blob = new Blob([buf], { type: 'audio/wav' });
-  const audio = new Audio(URL.createObjectURL(blob));
-  audio.loop = true;
-  audio.volume = 0.001; // 0だとiOSが最適化で止める
-  return audio;
+// 戦略：
+//   <Audio>タグではなくAudioContextのBufferSourceを使う。
+//   録音に使うAudioContextと同一セッションになり、
+//   iOSがバックグラウンドでセッションを切りにくくなる。
+//   GainNode経由で極小音量の出力を維持し「アクティブなセッション」と認識させ続ける。
+let silentSource = null;
+let silentGain = null;
+
+function startSilentLoop(ctx) {
+  if (silentSource) { try { silentSource.stop(); } catch(e) {} silentSource = null; }
+  const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate); // 1秒の無音バッファ
+  silentGain = ctx.createGain();
+  silentGain.gain.value = 0.001; // 0だとiOSが最適化で止める可能性あり
+  silentSource = ctx.createBufferSource();
+  silentSource.buffer = buf;
+  silentSource.loop = true;
+  silentSource.connect(silentGain);
+  silentGain.connect(ctx.destination);
+  silentSource.start();
+}
+
+function stopSilentLoop() {
+  if (silentSource) { try { silentSource.stop(); } catch(e) {} silentSource = null; }
+  if (silentGain) { silentGain.disconnect(); silentGain = null; }
 }
 
 // ── DOM ──────────────────────────────────────────
@@ -636,8 +639,8 @@ async function startRecording() {
     mediaRecorder.start(500); // 500ms刻みで保存（途中切断対策）
 
     // ── サイレント音声ループ開始（iOSセッション維持の核心）──
-    silentAudio = createSilentAudio();
-    await silentAudio.play().catch(() => {});
+    // AudioContextと同一セッションで無音ループを流す
+    startSilentLoop(audioContext);
 
     isRecording = true;
     isPaused = false;
@@ -675,7 +678,7 @@ function stopRecording() {
   stopTimer();
 
   // サイレント音声停止
-  if (silentAudio) { silentAudio.pause(); silentAudio = null; }
+  stopSilentLoop();
 
   mediaRecorder.stop();
   mediaRecorder.onstop = async () => {
@@ -933,9 +936,27 @@ async function requestWakeLock() {
     try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e) {}
   }
 }
+
+// ── バックグラウンド復帰時のAudioContext復元 ──────────────────────────────────────────
+// iOSは画面ロック時にAudioContextをsuspendする。
+// visible/focus/pageshowのタイミングでresumeし、silentLoopも再起動する。
+async function resumeAudioSession() {
+  if (!isRecording) return;
+  if (audioContext && audioContext.state === 'suspended') {
+    try {
+      await audioContext.resume();
+      // resumeできたらsilentLoopも再起動（止まっている可能性があるため）
+      startSilentLoop(audioContext);
+    } catch(e) { console.warn('AudioContext resume failed:', e); }
+  }
+  await requestWakeLock();
+}
+
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && isRecording) await requestWakeLock();
+  if (document.visibilityState === 'visible') await resumeAudioSession();
 });
+window.addEventListener('focus', () => resumeAudioSession());
+window.addEventListener('pageshow', () => resumeAudioSession());
 
 // ── Service Worker ──────────────────────────────────────────
 if ('serviceWorker' in navigator) {
