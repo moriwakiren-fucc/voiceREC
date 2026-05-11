@@ -380,11 +380,11 @@
 // ── State ──────────────────────────────────────────
 let audioContext = null;
 let analyser = null;
-let scriptProcessor = null;
 let sourceNode = null;
 let stream = null;
-let mp3Encoder = null;
-let mp3Buffers = [];
+let mediaRecorder = null;
+let audioChunks = [];
+let silentAudio = null;
 let timerInterval = null;
 let seconds = 0;
 let isRecording = false;
@@ -393,9 +393,28 @@ let recordings = JSON.parse(localStorage.getItem('recordings') || '[]');
 let currentPlayback = null;
 let waveHistory = new Float32Array(300).fill(0);
 
-const SAMPLE_RATE = 44100;
 const MP3_BITRATE = 128;
-const SCRIPT_BUFFER = 4096;
+
+// ── Silent Audio（iOSオーディオセッション維持）──────────────────────────────────────────
+// iOSはオーディオ出力がないとバックグラウンドでオーディオ処理を止める。
+// 無音WAVをloop再生することでセッションを「アクティブ」に保つ。
+function createSilentAudio() {
+  const sr = 44100, n = sr;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4, 36 + n*2, true);
+  w(8,'WAVE'); w(12,'fmt ');
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true);
+  w(36,'data'); v.setUint32(40,n*2,true);
+  const blob = new Blob([buf], { type: 'audio/wav' });
+  const audio = new Audio(URL.createObjectURL(blob));
+  audio.loop = true;
+  audio.volume = 0.001; // 0だとiOSが最適化で止める
+  return audio;
+}
 
 // ── DOM ──────────────────────────────────────────
 const btnRec = document.getElementById('btnRec');
@@ -473,47 +492,52 @@ function startTimer() {
 }
 function stopTimer() { clearInterval(timerInterval); }
 
-// ── Float32 → Int16 conversion ──────────────────────────────────────────
-function floatTo16BitPCM(float32Array) {
-  const int16 = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+// ── Float32 → Int16 ──────────────────────────────────────────
+function floatTo16BitPCM(f32) {
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
-  return int16;
+  return i16;
 }
 
-// ── Recording (ScriptProcessor → lamejs MP3) ──────────────────────────────────────────
+// ── Recording ──────────────────────────────────────────
+// 戦略：
+//   1. MediaRecorder（iOSネイティブ, m4a/aac）でバックグラウンド録音
+//   2. サイレント音声ループでiOSオーディオセッションを維持
+//   3. 録音停止後にWeb Audio APIでPCM展開 → lamejs で MP3 へ変換
+//
+// なぜMediaRecorder？
+//   ScriptProcessorはメインスレッド依存 → ロック時に止まる。
+//   MediaRecorderはOSレベルのネイティブAPIなのでバックグラウンドでも動作。
+
 async function startRecording() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: SAMPLE_RATE }
+      audio: { echoCancellation: true, noiseSuppression: true }
     });
 
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-
-    // Visualizer
+    // ── AudioContext（可視化のみ）──
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 512;
-
-    // ScriptProcessor for raw PCM access (works on iOS Safari)
-    scriptProcessor = audioContext.createScriptProcessor(SCRIPT_BUFFER, 1, 1);
-
     sourceNode = audioContext.createMediaStreamSource(stream);
     sourceNode.connect(analyser);
-    sourceNode.connect(scriptProcessor);
-    scriptProcessor.connect(audioContext.destination); // must connect to run on iOS
 
-    // Init lame MP3 encoder (mono, 44100Hz, 128kbps)
-    mp3Encoder = new lamejs.Mp3Encoder(1, audioContext.sampleRate, MP3_BITRATE);
-    mp3Buffers = [];
+    // ── MediaRecorder（録音本体）──
+    // iOSはaudio/mp4(aac)のみサポート。バックグラウンドでも動作するネイティブAPI。
+    const mime = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4'
+               : MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
+               : '';
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+    audioChunks = [];
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.start(500); // 500ms刻みで保存（途中切断対策）
 
-    scriptProcessor.onaudioprocess = (e) => {
-      if (!isRecording || isPaused) return;
-      const pcm = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
-      const encoded = mp3Encoder.encodeBuffer(pcm);
-      if (encoded.length > 0) mp3Buffers.push(new Int8Array(encoded));
-    };
+    // ── サイレント音声ループ開始（iOSセッション維持の核心）──
+    silentAudio = createSilentAudio();
+    await silentAudio.play().catch(() => {});
 
     isRecording = true;
     isPaused = false;
@@ -532,10 +556,12 @@ async function startRecording() {
 function pauseRecording() {
   if (!isRecording) return;
   if (isPaused) {
+    mediaRecorder.resume();
     isPaused = false;
     startTimer();
     setUIRecording();
   } else {
+    mediaRecorder.pause();
     isPaused = true;
     stopTimer();
     setUIPaused();
@@ -544,40 +570,69 @@ function pauseRecording() {
 
 function stopRecording() {
   if (!isRecording) return;
-
-  // Flush remaining MP3 frames
-  const finalChunk = mp3Encoder.flush();
-  if (finalChunk.length > 0) mp3Buffers.push(new Int8Array(finalChunk));
-
-  // Disconnect nodes
-  scriptProcessor.disconnect();
-  sourceNode.disconnect();
-  stream.getTracks().forEach(t => t.stop());
-  audioContext.close();
-
   isRecording = false;
   isPaused = false;
   stopTimer();
 
-  // Build MP3 Blob
-  const blob = new Blob(mp3Buffers, { type: 'audio/mpeg' });
-  const name = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/\s]/g,'-')}`;
-  const rec = { id: Date.now(), name, duration: seconds, ext: 'mp3', size: blob.size, date: new Date().toISOString() };
+  // サイレント音声停止
+  if (silentAudio) { silentAudio.pause(); silentAudio = null; }
 
+  mediaRecorder.stop();
+  mediaRecorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    if (audioContext) { audioContext.close(); audioContext = null; }
+
+    const recMime = mediaRecorder.mimeType || 'audio/mp4';
+    const recBlob = new Blob(audioChunks, { type: recMime });
+    showToast('MP3に変換中…');
+
+    // ── m4a/webm → PCM → MP3 変換 ──
+    try {
+      const arrayBuf = await recBlob.arrayBuffer();
+      const decodeCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+      const audioBuf = await decodeCtx.decodeAudioData(arrayBuf);
+      decodeCtx.close();
+
+      const pcmData = audioBuf.getChannelData(0); // モノラル
+      const encoder = new lamejs.Mp3Encoder(1, audioBuf.sampleRate, MP3_BITRATE);
+      const mp3Parts = [];
+      const chunkSize = 1152;
+      for (let i = 0; i < pcmData.length; i += chunkSize) {
+        const chunk = floatTo16BitPCM(pcmData.subarray(i, i + chunkSize));
+        const enc = encoder.encodeBuffer(chunk);
+        if (enc.length > 0) mp3Parts.push(new Uint8Array(enc));
+      }
+      const final = encoder.flush();
+      if (final.length > 0) mp3Parts.push(new Uint8Array(final));
+
+      const mp3Blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
+      saveRecording(mp3Blob);
+    } catch (e) {
+      // デコード失敗時はネイティブ形式で保存
+      console.warn('MP3変換失敗、元形式で保存:', e);
+      saveRecording(recBlob, recMime.includes('mp4') ? 'm4a' : 'webm');
+    }
+  };
+
+  setUIIdle();
+  bgNotice.classList.remove('show');
+}
+
+function saveRecording(blob, ext = 'mp3') {
+  const dur = seconds;
+  const name = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/\s]/g,'-')}`;
+  const rec = { id: Date.now(), name, duration: dur, ext, size: blob.size, date: new Date().toISOString() };
   const reader = new FileReader();
   reader.onload = () => {
     rec.b64 = reader.result;
     recordings.unshift(rec);
     try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {
-      showToast('容量不足: ダウンロードしてください');
+      showToast('容量不足: すぐにダウンロードしてください');
     }
     renderList();
-    showToast('MP3で保存しました ✓');
+    showToast(`${ext.toUpperCase()}で保存しました ✓`);
   };
   reader.readAsDataURL(blob);
-
-  setUIIdle();
-  bgNotice.classList.remove('show');
 }
 
 // ── UI states ──────────────────────────────────────────
