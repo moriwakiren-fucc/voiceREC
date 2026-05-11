@@ -317,6 +317,89 @@
     .list-section::-webkit-scrollbar { width: 3px; }
     .list-section::-webkit-scrollbar-track { background: transparent; }
     .list-section::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ── Name Modal ── */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.65);
+      display: flex; align-items: flex-end; justify-content: center;
+      z-index: 200;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    .modal-overlay.show { opacity: 1; pointer-events: all; }
+    .modal-sheet {
+      width: 100%; max-width: 480px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 20px 20px 0 0;
+      padding: 20px 20px calc(env(safe-area-inset-bottom) + 20px);
+      transform: translateY(100%);
+      transition: transform 0.3s cubic-bezier(0.34,1.2,0.64,1);
+    }
+    .modal-overlay.show .modal-sheet { transform: translateY(0); }
+    .modal-handle {
+      width: 36px; height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      margin: 0 auto 18px;
+    }
+    .modal-title {
+      font-family: var(--display);
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 14px;
+      color: var(--text);
+    }
+    .modal-input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+      -webkit-appearance: none;
+      margin-bottom: 14px;
+      transition: border-color 0.15s;
+    }
+    .modal-input:focus { border-color: var(--accent); }
+    .modal-hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+    .modal-hint span { color: var(--amber); }
+    .modal-btns {
+      display: flex; gap: 10px;
+    }
+    .modal-btn {
+      flex: 1; padding: 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 13px;
+      cursor: pointer;
+      -webkit-appearance: none;
+      outline: none;
+      transition: background 0.15s;
+    }
+    .modal-btn.cancel { background: var(--surface2); color: var(--muted); }
+    .modal-btn.confirm { background: var(--accent); color: white; border-color: var(--accent); font-weight: 500; }
+    .modal-btn:active { opacity: 0.8; }
+    .item-name-btn {
+      background: none; border: none; color: inherit;
+      font-family: var(--mono); font-size: 14px;
+      text-align: left; cursor: pointer; padding: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      width: 100%; margin-bottom: 3px;
+      -webkit-appearance: none; outline: none;
+    }
+    .item-name-btn:active { color: var(--accent); }
   </style>
 </head>
 <body>
@@ -374,6 +457,20 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- ファイル名入力モーダル -->
+<div class="modal-overlay" id="nameModal">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="modalTitle">ファイル名を入力</div>
+    <input class="modal-input" id="nameInput" type="text" maxlength="60" autocomplete="off" autocorrect="off" spellcheck="false">
+    <div class="modal-hint" id="modalHint"></div>
+    <div class="modal-btns">
+      <button class="modal-btn cancel" id="modalCancel">キャンセル</button>
+      <button class="modal-btn confirm" id="modalConfirm">保存</button>
+    </div>
+  </div>
+</div>
+
 <!-- lamejs: pure-JS MP3 encoder, no WASM needed, works on iOS Safari -->
 <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
 <script>
@@ -399,7 +496,10 @@ const MP3_BITRATE = 128;
 // iOSはオーディオ出力がないとバックグラウンドでオーディオ処理を止める。
 // 無音WAVをloop再生することでセッションを「アクティブ」に保つ。
 function createSilentAudio() {
-  const sr = 44100, n = sr;
+  // 60分分の無音バッファを生成。
+  // ループの繋ぎ目回数を最小化（2時間録音でも2回のみ）。
+  // 無音データはすべて0なのでメモリ消費はほぼゼロ。
+  const sr = 44100, n = sr * 60 * 60; // 60分
   const buf = new ArrayBuffer(44 + n * 2);
   const v = new DataView(buf);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
@@ -618,9 +718,62 @@ function stopRecording() {
   bgNotice.classList.remove('show');
 }
 
-function saveRecording(blob, ext = 'mp3') {
+// ── Name Modal ──────────────────────────────────────────
+const nameModal = document.getElementById('nameModal');
+const nameInput = document.getElementById('nameInput');
+const modalTitle = document.getElementById('modalTitle');
+const modalHint = document.getElementById('modalHint');
+const modalConfirm = document.getElementById('modalConfirm');
+const modalCancel = document.getElementById('modalCancel');
+let _modalResolve = null;
+
+function openNameModal(defaultName, title = 'ファイル名を入力', hint = '') {
+  return new Promise(resolve => {
+    _modalResolve = resolve;
+    modalTitle.textContent = title;
+    modalHint.innerHTML = hint;
+    nameInput.value = defaultName;
+    nameModal.classList.add('show');
+    setTimeout(() => { nameInput.focus(); nameInput.select(); }, 300);
+  });
+}
+function closeNameModal(result) {
+  nameModal.classList.remove('show');
+  if (_modalResolve) { _modalResolve(result); _modalResolve = null; }
+}
+modalConfirm.addEventListener('click', () => {
+  const v = nameInput.value.trim();
+  if (v) closeNameModal(v);
+});
+modalCancel.addEventListener('click', () => closeNameModal(null));
+nameInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { const v = nameInput.value.trim(); if (v) closeNameModal(v); }
+  if (e.key === 'Escape') closeNameModal(null);
+});
+nameModal.addEventListener('click', e => { if (e.target === nameModal) closeNameModal(null); });
+
+// ── 重複チェック & 連番付与 ──────────────────────────────────────────
+function resolveUniqueName(name, excludeId = null) {
+  const existing = recordings.filter(r => r.id !== excludeId).map(r => r.name);
+  if (!existing.includes(name)) return name;
+  let i = 2;
+  while (existing.includes(`${name}_${i}`)) i++;
+  return `${name}_${i}`;
+}
+
+// ── Save Recording ──────────────────────────────────────────
+async function saveRecording(blob, ext = 'mp3') {
   const dur = seconds;
-  const name = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/\s]/g,'-')}`;
+  const defaultName = `録音_${new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/\s:]/g,'-')}`;
+
+  const inputName = await openNameModal(
+    defaultName,
+    'ファイル名を入力',
+    '重複する名前は自動で <span>_2, _3…</span> が付きます'
+  );
+  if (!inputName) { showToast('保存をキャンセルしました'); return; }
+
+  const name = resolveUniqueName(inputName.replace(/[/\\:*?"<>|]/g, '_'));
   const rec = { id: Date.now(), name, duration: dur, ext, size: blob.size, date: new Date().toISOString() };
   const reader = new FileReader();
   reader.onload = () => {
@@ -630,9 +783,25 @@ function saveRecording(blob, ext = 'mp3') {
       showToast('容量不足: すぐにダウンロードしてください');
     }
     renderList();
-    showToast(`${ext.toUpperCase()}で保存しました ✓`);
+    showToast(`「${name}」を保存しました ✓`);
   };
   reader.readAsDataURL(blob);
+}
+
+// ── Rename Recording ──────────────────────────────────────────
+async function renameRecording(i) {
+  const rec = recordings[i];
+  const inputName = await openNameModal(
+    rec.name,
+    'ファイル名を変更',
+    '重複する名前は自動で <span>_2, _3…</span> が付きます'
+  );
+  if (!inputName || inputName.trim() === rec.name) return;
+  const name = resolveUniqueName(inputName.trim().replace(/[/\\:*?"<>|]/g, '_'), rec.id);
+  recordings[i].name = name;
+  try { localStorage.setItem('recordings', JSON.stringify(recordings)); } catch(e) {}
+  renderList();
+  showToast(`「${name}」に変更しました`);
 }
 
 // ── UI states ──────────────────────────────────────────
@@ -681,7 +850,7 @@ function renderList() {
     <div class="recording-item" data-i="${i}">
       <div class="item-icon">🎵</div>
       <div class="item-info">
-        <div class="item-name">${r.name}.mp3</div>
+        <button class="item-name-btn" data-rename="${i}" title="タップしてリネーム">${r.name}.mp3</button>
         <div class="item-meta">
           <span>${fmtTime(r.duration)}</span>
           <span>${(r.size/1024).toFixed(0)}KB</span>
@@ -702,6 +871,9 @@ function renderList() {
     </div>
   `).join('');
 
+  listEl.querySelectorAll('[data-rename]').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); renameRecording(parseInt(btn.dataset.rename)); });
+  });
   listEl.querySelectorAll('[data-play]').forEach(btn => {
     btn.addEventListener('click', e => { e.stopPropagation(); playRecording(parseInt(btn.dataset.play), btn); });
   });
