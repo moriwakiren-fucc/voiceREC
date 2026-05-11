@@ -2,7 +2,7 @@
   "name": "REC — バックグラウンド録音",
   "short_name": "REC",
   "description": "iPadのロック中もバックグラウンドで動作する録音アプリ",
-  "start_url": "/index.html",
+  "start_url": "https://moriwakiren-fucc.github.io/voiceREC/",
   "display": "standalone",
   "background_color": "#0a0a0f",
   "theme_color": "#0a0a0f",
